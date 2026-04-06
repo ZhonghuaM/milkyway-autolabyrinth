@@ -1,0 +1,28 @@
+# auth / browser state
+mwidle_state*.json
+accounts.json
+accounts.*.json
+
+# generated outputs
+*.csv
+*.png
+*.html
+*.zip
+
+# debug folders
+autolabyrinth_debug/
+escape_debug/
+escape_trace_debug/
+autocombined_debug/
+autopay_debug/
+
+# browser/profile folders
+chrome_profiles/
+mw_profiles/
+mwidle_playwright_profile/
+pw_stripe_profile/
+playwright/
+
+# python cache
+__pycache__/
+*.pyc
