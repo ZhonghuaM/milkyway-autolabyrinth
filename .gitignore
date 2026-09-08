@@ -1,13 +1,27 @@
 # auth / browser state
+*.json
 mwidle_state*.json
 accounts.json
 accounts.*.json
+!accounts.example.json
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.har
+*.sqlite*
+*.db
 
 # generated outputs
 *.csv
 *.png
 *.html
 *.zip
+*.log
+.DS_Store
+*.lock
 
 # debug folders
 autolabyrinth_debug/
@@ -26,3 +40,5 @@ playwright/
 # python cache
 __pycache__/
 *.pyc
+.venv/
+venv/

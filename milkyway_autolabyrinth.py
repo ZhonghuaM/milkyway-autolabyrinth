@@ -13,6 +13,9 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import urlsplit
+
+from labyrinth_events import LabyrinthWebSocketWatcher
 
 from playwright.async_api import (
     Browser,
@@ -41,8 +44,12 @@ class AccountConfig:
 class RunSettings:
     loops: int = 0                # 0 = forever
     delay_sec: float = 20.0
-    refresh_every: int = 40
-    recycle_context_every: int = 200
+    event_driven: bool = True
+    watchdog_sec: float = 600.0
+    startup_timeout_ms: int = 60000
+    proxy_server: str | None = None
+    refresh_every: int = 0
+    recycle_context_every: int = 0
     low_ticket_threshold: int = 0
     navigation_timeout_ms: int = 15000
     results_csv: str = "auto_labyrinth_results.csv"
@@ -63,7 +70,7 @@ class TicketState:
 
 @dataclass(slots=True)
 class LabyrinthState:
-    state: str = "unknown"  # entry | in_labyrinth | finished | unknown
+    state: str = "unknown"  # entry | in_labyrinth | finished | needs_escape | unknown
     detail: str = ""
 
 
@@ -98,7 +105,10 @@ ENTRY_COUNT_PATTERNS = [
 ]
 
 FLOOR_PATTERN = re.compile(r"\bFloor\s+(\d+)\s*\(Treasure:\s*(\d+\s*/\s*\d+)\)", re.I)
-ENTRY_DIALOG_PATTERN = re.compile(r"maximum allowed supplies.*crates|without the maximum allowed supplies and crates", re.I)
+ENTRY_DIALOG_PATTERN = re.compile(
+    r"maximum.*(?:supplies|crates)|without.*(?:supplies|crates)|not.*(?:supplies|crates)|enter.*labyrinth",
+    re.I,
+)
 AUTH_SIGNALS = [
     re.compile(r"\blogin\b", re.I),
     re.compile(r"\bsign in\b", re.I),
@@ -132,6 +142,13 @@ def normalize_space(text: str | None) -> str:
     if not text:
         return ""
     return re.sub(r"\s+", " ", text).strip()
+
+
+def redact_text(value: str, limit: int = 500) -> str:
+    text = re.sub(r"eyJ[\w-]+\.[\w-]+\.[\w-]+", "<redacted:jwt>", value)
+    text = re.sub(r"[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}", "<redacted:email>", text)
+    text = re.sub(r"(https?://[^\s?#]+)[?#][^\s]*", r"\1?<redacted>", text)
+    return text[:limit]
 
 
 def format_duration(seconds: float | int | None) -> str:
@@ -255,21 +272,36 @@ def as_click_target(locator: Locator) -> Locator:
 def button_candidates(scope: Page | Locator, names: list[str]) -> list[Locator]:
     out: list[Locator] = []
     for name in names:
+        flexible_name = r"\s+".join(re.escape(part) for part in name.split())
+        pat = re.compile(rf"^\s*{flexible_name}\s*$", re.I)
+        txt_loc = scope.get_by_text(pat).first
         out.extend([
-            scope.get_by_role("button", name=re.compile(rf"^\s*{re.escape(name)}\s*$", re.I)).first,
-            scope.get_by_text(re.compile(rf"^\s*{re.escape(name)}\s*$", re.I)).first,
+            scope.get_by_role("button", name=pat).first,
+            txt_loc,
+            as_click_target(txt_loc),
         ])
     return out
 
 
-def nav_candidates(page: Page, aria_label: str, names: list[str]) -> list[Locator]:
+def nav_candidates(page: Page, aria_label: str, names: list[str], svg_hint: str | None = None) -> list[Locator]:
     cands: list[Locator] = []
-    icon = page.locator(f'[aria-label="{aria_label}"]').first
-    cands.extend([icon, as_click_target(icon)])
+
+    def add_visible_variants(locator: Locator) -> None:
+        # The app can keep desktop and compact/mobile navigation trees in the
+        # DOM at the same time. The first match is sometimes the hidden copy.
+        for candidate in (locator.first, locator.last):
+            cands.extend([candidate, as_click_target(candidate)])
+
+    add_visible_variants(page.locator(f'[aria-label="{aria_label}"]'))
     nav = page.locator('div[class*="NavigationBar_navigationLink"]')
     for name in names:
-        text_loc = nav.filter(has_text=re.compile(rf"\b{re.escape(name)}\b", re.I)).first
-        cands.extend([text_loc, as_click_target(text_loc)])
+        pattern = re.compile(rf"\b{re.escape(name)}\b", re.I)
+        add_visible_variants(nav.filter(has_text=pattern))
+        add_visible_variants(page.get_by_text(pattern))
+        add_visible_variants(page.get_by_role("button", name=pattern))
+        add_visible_variants(page.get_by_role("link", name=pattern))
+    if svg_hint:
+        add_visible_variants(page.locator(f'use[href*="{svg_hint}"]'))
     return cands
 
 
@@ -354,20 +386,25 @@ async def dismiss_offline_progress_modal(page: Page, timeout_ms: int = 2500) -> 
 
 async def maybe_click_with_intercept_retry(page: Page, locator: Locator, timeout_ms: int = 5000) -> None:
     try:
-        await locator.click(timeout=timeout_ms)
+        await click_locator_hard(page, locator, timeout_ms=timeout_ms)
     except Exception as e:
         if "intercepts pointer events" in str(e):
             await dismiss_offline_progress_modal(page, timeout_ms=2500)
-            await locator.click(timeout=timeout_ms)
+            await click_locator_hard(page, locator, timeout_ms=timeout_ms)
         else:
             raise
 
 
-async def ensure_probably_logged_in(page: Page) -> None:
+async def ensure_probably_logged_in(page: Page, timeout_ms: int = 60000) -> None:
     shell_markers = [
+        page.locator('div[class*="NavigationBar_navigationBar"]').first,
+        page.locator('div[class*="NavigationBar_navigationBar"]').last,
         page.locator('div[class*="NavigationBar_navigationLink"]').first,
+        page.locator('div[class*="NavigationBar_navigationLink"]').last,
         page.locator('[aria-label^="navigationBar."]').first,
-        page.locator('main').first,
+        page.locator('[aria-label^="navigationBar."]').last,
+        page.locator('[class*="NavigationBar_navToggleButton"]').first,
+        page.locator('[class*="NavigationBar_navToggleButton"]').last,
         page.locator('div[class*="LabyrinthPanel_"]').first,
         page.locator('div[class*="SettingsPanel_"]').first,
     ]
@@ -375,33 +412,53 @@ async def ensure_probably_logged_in(page: Page) -> None:
         if await locator_is_visible(marker):
             return
 
-    end = time.time() + 8.0
     body = ""
+    started_at = time.time()
+    end = started_at + max(1000, timeout_ms) / 1000
     while time.time() < end:
         await asyncio.sleep(0.25)
         for marker in shell_markers:
             if await locator_is_visible(marker):
                 return
         body = await page_body_text(page, limit=2500)
-        if body:
-            break
+        auth_hits = sum(1 for pat in AUTH_SIGNALS if pat.search(body))
+        if auth_hits >= 2:
+            raise RuntimeError("saved state appears invalid; page still looks like login/auth screen")
+        if re.search(
+            r"403\s+ERROR|request blocked|request could not be satisfied|generated by cloudfront",
+            body,
+            re.I,
+        ):
+            raise RuntimeError("Milky Way game page was blocked by CloudFront")
+        if time.time() - started_at >= 2.0:
+            try:
+                title = await page.title()
+            except Exception:
+                title = ""
+            if re.search(r"^Disconnected\b", title, re.I):
+                diagnostic = await game_shell_diagnostic(page)
+                raise RuntimeError(f"Milky Way game page is Disconnected; {diagnostic}")
 
-    auth_hits = sum(1 for pat in AUTH_SIGNALS if pat.search(body))
-    if auth_hits >= 2:
-        raise RuntimeError(
-            "saved state appears invalid; page still looks like login/auth screen"
-        )
+    diagnostic = await game_shell_diagnostic(page)
+    raise RuntimeError(f"game shell did not become ready within {timeout_ms}ms; {diagnostic}")
 
 
-async def goto_game_page(page: Page, game_url: str, *, just_reloaded: bool = False) -> None:
-    await page.goto(game_url, wait_until="domcontentloaded")
-    try:
-        await page.wait_for_load_state("networkidle", timeout=5000)
-    except Exception:
-        pass
+async def goto_game_page(
+    page: Page,
+    game_url: str,
+    *,
+    just_reloaded: bool = False,
+    shell_timeout_ms: int = 60000,
+) -> None:
+    await page.goto(game_url, wait_until="domcontentloaded", timeout=shell_timeout_ms)
+    if just_reloaded:
+        try:
+            await page.wait_for_load_state("networkidle", timeout=2000)
+        except Exception:
+            pass
     if just_reloaded:
         await dismiss_offline_progress_modal(page, timeout_ms=2500)
-    await ensure_probably_logged_in(page)
+    await ensure_probably_logged_in(page, timeout_ms=shell_timeout_ms)
 
 
 async def find_labyrinth_root(page: Page, timeout_sec: float = 0.8) -> Locator | None:
@@ -448,20 +505,80 @@ async def wait_for_settings_panel(page: Page, timeout_ms: int = 10000) -> bool:
 
 
 async def goto_labyrinth_panel(page: Page, timeout_ms: int = 15000) -> None:
-    if await wait_for_labyrinth_panel(page, timeout_ms=1200):
+    if await wait_for_labyrinth_panel(page, timeout_ms=900):
         return
-    target = await first_visible_locator(nav_candidates(page, "navigationBar.labyrinth", ["Labyrinth", "迷宫"]), timeout=4.0)
-    if target is None:
-        raise RuntimeError("labyrinth navigation link not found")
-    await maybe_click_with_intercept_retry(page, target)
-    if not await wait_for_labyrinth_panel(page, timeout_ms=timeout_ms):
-        raise RuntimeError("failed to open labyrinth panel")
+
+    try:
+        await ensure_probably_logged_in(
+            page,
+            timeout_ms=min(20000, max(3000, timeout_ms)),
+        )
+    except Exception as exc:
+        raise RuntimeError(f"failed to open labyrinth panel: {exc}") from exc
+
+    last_error = ""
+    for attempt in range(1, 4):
+        if attempt > 1:
+            try:
+                await clear_visible_dialogs(page, max_dialogs=2)
+            except Exception as e:
+                last_error = f"clear dialogs failed: {e}"
+            try:
+                await dismiss_offline_progress_modal(page, timeout_ms=1200)
+            except Exception:
+                pass
+
+        target = await first_visible_locator(
+            nav_candidates(page, "navigationBar.labyrinth", ["Labyrinth", "迷宫"], svg_hint="labyrinth"),
+            timeout=2.0,
+        )
+        if target is None:
+            toggle = await first_visible_locator(
+                [
+                    page.locator('[class*="NavigationBar_navToggleButton"]').first,
+                    page.locator('[class*="NavigationBar_navToggleButton"]').last,
+                    page.get_by_role("button", name=re.compile(r"navigation|menu|菜单", re.I)).first,
+                    page.get_by_role("button", name=re.compile(r"navigation|menu|菜单", re.I)).last,
+                ],
+                timeout=0.8,
+            )
+            if toggle is not None:
+                try:
+                    await click_locator_dom_first(page, toggle, timeout_ms=1500)
+                    await page.wait_for_timeout(250)
+                    target = await first_visible_locator(
+                        nav_candidates(
+                            page,
+                            "navigationBar.labyrinth",
+                            ["Labyrinth", "迷宫"],
+                            svg_hint="labyrinth",
+                        ),
+                        timeout=1.5,
+                    )
+                except Exception as e:
+                    last_error = f"navigation toggle failed: {redact_text(str(e), limit=220)}"
+        if target is None:
+            last_error = "labyrinth navigation link not found"
+            continue
+
+        try:
+            await maybe_click_with_intercept_retry(page, target, timeout_ms=2500)
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+        if await wait_for_labyrinth_panel(page, timeout_ms=min(timeout_ms, 4500)):
+            return
+        last_error = "panel did not become visible"
+
+    diagnostic = await game_shell_diagnostic(page)
+    raise RuntimeError(f"failed to open labyrinth panel: {last_error}; {diagnostic}")
 
 
 async def goto_settings_panel(page: Page, timeout_ms: int = 15000) -> None:
     if await wait_for_settings_panel(page, timeout_ms=1200):
         return
-    target = await first_visible_locator(nav_candidates(page, "navigationBar.settings", ["Settings", "设置"]), timeout=4.0)
+    target = await first_visible_locator(nav_candidates(page, "navigationBar.settings", ["Settings", "设置"], svg_hint="settings"), timeout=4.0)
     if target is None:
         raise RuntimeError("settings navigation link not found")
     await maybe_click_with_intercept_retry(page, target)
@@ -498,9 +615,9 @@ async def read_active_action_text(page: Page) -> str:
     if m:
         return normalize_space(m.group(1))
     title = normalize_space(await page.title())
-    if title:
-        return title
-    return ""
+    if re.search(r"\bDoing nothing\b", title, re.I):
+        return "Doing nothing"
+    return title
 
 
 async def detect_labyrinth_state(page: Page) -> LabyrinthState:
@@ -508,28 +625,26 @@ async def detect_labyrinth_state(page: Page) -> LabyrinthState:
     active_action = await read_active_action_text(page)
     active_is_lab = bool(re.search(r"\bLabyrinth\b", active_action, re.I))
 
-    floor_match = FLOOR_PATTERN.search(text)
-    exit_btn = await first_visible_locator(button_candidates(page, ["Escape", "Escape Labyrinth", "结束迷宫", "逃离迷宫"]), timeout=0.35)
-
-    # When the floor cap is reached, the page can still show the last labyrinth floor,
-    # but the active action bar has already switched back to another task. In that case
-    # we should escape instead of idling forever on the old floor screen.
-    if floor_match:
-        if active_action and not active_is_lab:
-            return LabyrinthState(
-                "needs_escape",
-                f"floor {floor_match.group(1)} visible but active action is '{active_action[:80]}'",
-            )
-        return LabyrinthState("in_labyrinth", f"floor {floor_match.group(1)} treasure {floor_match.group(2)}")
-
-    if exit_btn is not None:
-        if active_action and not active_is_lab:
-            return LabyrinthState("needs_escape", f"escape visible and active action is '{active_action[:80]}'")
-        return LabyrinthState("in_labyrinth", "escape button visible")
-
     claim_btn = await first_visible_locator(button_candidates(page, ["Claim", "Collect", "领取", "收取"]), timeout=0.35)
     if claim_btn is not None:
         return LabyrinthState("finished", "claim/collect visible")
+
+    floor_match = FLOOR_PATTERN.search(text)
+    exit_btn = await first_visible_locator(button_candidates(page, ["Escape", "Escape Labyrinth", "结束迷宫", "逃离迷宫"]), timeout=0.35)
+
+    if floor_match:
+        if not active_is_lab:
+            if not active_action:
+                active_action = "no active action"
+            return LabyrinthState("needs_escape", f"floor {floor_match.group(1)} visible but active action is '{active_action[:80]}'")
+        return LabyrinthState("in_labyrinth", f"floor {floor_match.group(1)} treasure {floor_match.group(2)}")
+
+    if exit_btn is not None:
+        if not active_is_lab:
+            if not active_action:
+                active_action = "no active action"
+            return LabyrinthState("needs_escape", f"escape visible and active action is '{active_action[:80]}'")
+        return LabyrinthState("in_labyrinth", "escape button visible")
 
     enter_btn = await first_visible_locator(button_candidates(page, ["Enter Labyrinth", "进入迷宫"]), timeout=0.35)
     if enter_btn is not None:
@@ -615,11 +730,15 @@ async def maybe_accept_entry_dialog(page: Page) -> tuple[bool, str]:
         return False, "no entry confirm dialog"
 
     text = await locator_text(dialog, limit=1600)
-    if not ENTRY_DIALOG_PATTERN.search(text):
+    looks_like_entry_dialog = (
+        ENTRY_DIALOG_PATTERN.search(text)
+        or (re.search(r"\bLabyrinth\b", text, re.I) and re.search(r"supply|supplies|crate|maximum|enter|sure", text, re.I))
+    )
+    if not looks_like_entry_dialog:
         return False, f"dialog visible but not entry confirm: {text[:120]}"
 
     yes_btn = await first_visible_enabled_locator(
-        button_candidates(dialog, ["Yes", "OK", "Continue", "确定", "确认"]),
+        button_candidates(dialog, ["Yes", "OK", "Confirm", "Continue", "确定", "确认"]),
         timeout=2.0,
     )
     if yes_btn is None:
@@ -631,53 +750,97 @@ async def maybe_accept_entry_dialog(page: Page) -> tuple[bool, str]:
 
 
 async def enter_labyrinth(page: Page, timeout_ms: int) -> tuple[bool, str, int | None]:
-    root = await find_labyrinth_root(page, timeout_sec=0.8) or page
-
-    enter_btn = await first_visible_enabled_locator(
-        [
-            *button_candidates(root, ["Enter Labyrinth", "进入迷宫"]),
-            *button_candidates(page, ["Enter Labyrinth", "进入迷宫"]),
-        ],
-        timeout=2.0,
-    )
-    if enter_btn is None:
-        return False, "enter labyrinth button not found", None
-
-    await maybe_click_with_intercept_retry(page, enter_btn)
-    await page.wait_for_timeout(300)
-
-    accepted, dialog_detail = await maybe_accept_entry_dialog(page)
-    if accepted:
-        LOG.info("labyrinth entry dialog: %s", dialog_detail)
-        await page.wait_for_timeout(300)
-
-    start_btn = await first_visible_enabled_locator(
-        [
-            *button_candidates(page, ["Start", "Start Now", "开始", "立即开始"]),
-            *button_candidates(root, ["Start", "Start Now", "开始", "立即开始"]),
-        ],
-        timeout=3.0,
-    )
-    if start_btn is None:
-        state = await detect_labyrinth_state(page)
-        return False, f"start button not found after enter; state={state.state} ({state.detail})", None
-
-    await maybe_click_with_intercept_retry(page, start_btn)
-    await page.wait_for_timeout(500)
-
-    end = time.time() + timeout_ms / 1000
+    notes: list[str] = []
     last_state = LabyrinthState()
-    while time.time() < end:
+
+    async def find_action(names: list[str], timeout: float) -> Locator | None:
+        root = await find_labyrinth_root(page, timeout_sec=0.8) or page
+        return await first_actionable_locator(
+            [
+                *actionable_button_candidates(root, names),
+                *actionable_button_candidates(page, names),
+            ],
+            timeout=timeout,
+        )
+
+    for attempt in range(1, 5):
         last_state = await detect_labyrinth_state(page)
         floor = await get_current_floor(page)
         if last_state.state == "in_labyrinth":
-            return True, (f"entered labyrinth on floor {floor}" if floor is not None else "entered labyrinth"), floor
-        await asyncio.sleep(0.25)
+            prefix = f"{'; '.join(notes)}; " if notes else ""
+            return True, f"{prefix}entered labyrinth on floor {floor if floor is not None else '?'}", floor
 
-    return False, f"labyrinth state after enter attempt: {last_state.state} ({last_state.detail})", None
+        # A previous Enter click can leave the panel directly on Start. Always
+        # resume from that state instead of requiring Enter to still be visible.
+        start_btn = await find_action(["Start Now", "Start", "立即开始", "开始"], timeout=0.7)
+        if start_btn is None:
+            enter_btn = await find_action(["Enter Labyrinth", "进入迷宫"], timeout=1.5)
+            if enter_btn is None:
+                if attempt < 4:
+                    await page.wait_for_timeout(350)
+                    try:
+                        await goto_labyrinth_panel(page, timeout_ms=min(timeout_ms, 5000))
+                    except Exception:
+                        pass
+                    continue
+                break
+
+            await maybe_click_with_intercept_retry(page, enter_btn, timeout_ms=2500)
+            notes.append(f"clicked Enter attempt {attempt}")
+            await page.wait_for_timeout(300)
+
+            for _ in range(3):
+                accepted, dialog_detail = await maybe_accept_entry_dialog(page)
+                if not accepted:
+                    if "dialog visible" in dialog_detail:
+                        notes.append(dialog_detail)
+                    break
+                notes.append(dialog_detail)
+                await page.wait_for_timeout(300)
+
+            end_after_enter = time.time() + min(6.0, max(3.0, timeout_ms / 1000))
+            while time.time() < end_after_enter:
+                last_state = await detect_labyrinth_state(page)
+                floor = await get_current_floor(page)
+                if last_state.state == "in_labyrinth":
+                    return True, f"{'; '.join(notes)}; entered labyrinth on floor {floor if floor is not None else '?'}", floor
+
+                start_btn = await find_action(["Start Now", "Start", "立即开始", "开始"], timeout=0.35)
+                if start_btn is not None:
+                    break
+                await asyncio.sleep(0.2)
+
+            if start_btn is None:
+                # A swallowed Enter click leaves the same entry button on screen.
+                # Retry it with a fresh locator instead of waiting for the next pass.
+                last_state = await detect_labyrinth_state(page)
+                if last_state.state == "entry":
+                    continue
+                break
+        else:
+            notes.append(f"resumed at Start attempt {attempt}")
+
+        await maybe_click_with_intercept_retry(page, start_btn, timeout_ms=2500)
+        notes.append("clicked Start Now")
+        await page.wait_for_timeout(400)
+
+        end_after_start = time.time() + min(8.0, max(4.0, timeout_ms / 1000))
+        while time.time() < end_after_start:
+            last_state = await detect_labyrinth_state(page)
+            floor = await get_current_floor(page)
+            if last_state.state == "in_labyrinth":
+                return True, f"{'; '.join(notes)}; labyrinth started on floor {floor if floor is not None else '?'}", floor
+            await asyncio.sleep(0.25)
+
+        if last_state.state != "entry":
+            break
+
+    state = last_state if last_state.state != "unknown" else await detect_labyrinth_state(page)
+    prefix = f"{'; '.join(notes)}; " if notes else ""
+    return False, f"{prefix}could not start labyrinth; state={state.state} ({state.detail})", None
 
 async def click_locator_hard(page: Page, locator: Locator, timeout_ms: int = 2500) -> None:
-    last_err = None
+    last_err: Exception | None = None
 
     try:
         await locator.scroll_into_view_if_needed(timeout=timeout_ms)
@@ -699,11 +862,7 @@ async def click_locator_hard(page: Page, locator: Locator, timeout_ms: int = 250
     try:
         box = await locator.bounding_box()
         if box:
-            x = box["x"] + box["width"] / 2
-            y = box["y"] + box["height"] / 2
-            await page.mouse.move(x, y)
-            await page.mouse.down()
-            await page.mouse.up()
+            await page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
             return
     except Exception as e:
         last_err = e
@@ -871,28 +1030,50 @@ async def escape_labyrinth(page: Page, timeout_ms: int = 15000) -> tuple[bool, s
     if state.state not in {"in_labyrinth", "needs_escape"}:
         return True, f"not in labyrinth ({state.state})"
 
-    escape_btn = page.get_by_role("button", name=re.compile(r"^\s*Escape\s*$", re.I)).last
-    try:
-        await escape_btn.click(timeout=2000)
-    except Exception:
-        await escape_btn.click(force=True, timeout=2000)
+    async def find_escape_button(timeout: float = 1.2) -> Locator | None:
+        root = await find_labyrinth_root(page, timeout_sec=0.5) or page
+        return await first_visible_enabled_locator(
+            [
+                *button_candidates(root, ["Escape", "Escape Labyrinth", "结束迷宫", "逃离迷宫"]),
+                *button_candidates(page, ["Escape", "Escape Labyrinth", "结束迷宫", "逃离迷宫"]),
+                page.locator("button").filter(has_text=re.compile(r"^\s*Escape\s*$", re.I)).last,
+            ],
+            timeout=timeout,
+        )
 
-    notes.append("clicked Escape")
+    per_attempt_wait = min(5.0, max(2.0, timeout_ms / 3000))
+    for attempt in range(1, 3):
+        escape_btn = await find_escape_button(timeout=1.2)
+        if escape_btn is None:
+            try:
+                await goto_labyrinth_panel(page, timeout_ms=min(timeout_ms, 5000))
+                await page.wait_for_timeout(250)
+            except Exception as e:
+                notes.append(f"escape panel retry failed: {e}")
+            escape_btn = await find_escape_button(timeout=2.0)
 
-    ok, chain_notes = await accept_escape_dialog_chain(page, max_dialogs=3)
-    notes.extend(chain_notes)
-    if not ok:
-        return False, "; ".join(notes)
+        if escape_btn is None:
+            state = await detect_labyrinth_state(page)
+            raise RuntimeError(f"escape button not found; state={state.state} ({state.detail})")
 
-    end = time.time() + timeout_ms / 1000
+        await maybe_click_with_intercept_retry(page, escape_btn, timeout_ms=2500)
+        notes.append(f"clicked Escape attempt {attempt}")
 
-    # 先给前端一点时间自己切回入口
-    while time.time() < end:
+        ok, chain_notes = await accept_escape_dialog_chain(page, max_dialogs=3)
+        notes.extend(chain_notes)
+        if not ok:
+            return False, "; ".join(notes)
+
+        end = time.time() + per_attempt_wait
+        while time.time() < end:
+            state = await detect_labyrinth_state(page)
+            if state.state in {"entry", "finished", "unknown"}:
+                notes.append(f"final_state={state.state}")
+                return True, "; ".join(notes)
+            await asyncio.sleep(0.25)
+
         state = await detect_labyrinth_state(page)
-        if state.state in {"entry", "finished", "unknown"}:
-            notes.append(f"final_state={state.state}")
-            return True, "; ".join(notes)
-        await asyncio.sleep(0.25)
+        notes.append(f"escape attempt {attempt} left state={state.state} ({state.detail})")
 
     # 再做一次 reload 兜底
     try:
@@ -925,18 +1106,158 @@ async def escape_labyrinth(page: Page, timeout_ms: int = 15000) -> tuple[bool, s
     return False, "; ".join(notes)
 
 
+def actionable_button_candidates(scope: Page | Locator, names: list[str]) -> list[Locator]:
+    """Return actual click targets, excluding enabled-looking text inside disabled buttons."""
+    out: list[Locator] = []
+    for name in names:
+        flexible_name = r"\s+".join(re.escape(part) for part in name.split())
+        pat = re.compile(rf"^\s*{flexible_name}\s*$", re.I)
+        text = scope.get_by_text(pat).first
+        out.extend(
+            [
+                scope.get_by_role("button", name=pat).first,
+                scope.locator("button").filter(has_text=pat).first,
+                as_click_target(text),
+            ]
+        )
+    return out
+
+async def first_actionable_locator(locators: Iterable[Locator], timeout: float = 4.0) -> Locator | None:
+    end = time.time() + timeout
+    while time.time() < end:
+        for loc in locators:
+            try:
+                cand = loc.first
+                if await cand.count() > 0 and await cand.is_visible() and await cand.is_enabled():
+                    return cand
+            except Exception:
+                pass
+        await asyncio.sleep(0.12)
+    return None
+
+async def click_locator_dom_first(page: Page, locator: Locator, timeout_ms: int = 1200) -> None:
+    try:
+        await locator.evaluate("(el) => el.click()", timeout=timeout_ms)
+        return
+    except Exception:
+        await click_locator_hard(page, locator, timeout_ms=timeout_ms)
+
+async def game_shell_diagnostic(page: Page) -> str:
+    """Return non-sensitive readiness details for navigation recovery logs."""
+    try:
+        parts = urlsplit(page.url)
+        safe_url = f"{parts.scheme}://{parts.netloc}{parts.path}"
+    except Exception:
+        safe_url = "unknown"
+    try:
+        title = normalize_space(await page.title())[:100]
+    except Exception:
+        title = ""
+    try:
+        state = await page.evaluate(
+            """
+            () => ({
+                documentReady: document.readyState,
+                rootChildren: document.querySelector('#root')?.childElementCount ?? -1,
+                mainCount: document.querySelectorAll('main').length,
+                navContainers: document.querySelectorAll('[class*="NavigationBar_navigationBar"]').length,
+                navLinks: document.querySelectorAll('[class*="NavigationBar_navigationLink"]').length,
+                navLabels: document.querySelectorAll('[aria-label^="navigationBar."]').length,
+                labyrinthLabels: document.querySelectorAll('[aria-label="navigationBar.labyrinth"]').length,
+                dialogs: document.querySelectorAll('[role="dialog"], .MuiDialog-root').length,
+                websocketState: window.gameWebsocket?.wsclient?.readyState ?? null,
+            })
+            """
+        )
+    except Exception as exc:
+        return f"url={safe_url} title={title!r} diagnostic_error={redact_text(str(exc), limit=180)}"
+
+    return (
+        f"url={safe_url} title={title!r} document={state.get('documentReady')} "
+        f"root_children={state.get('rootChildren')} main={state.get('mainCount')} "
+        f"nav_containers={state.get('navContainers')} nav_links={state.get('navLinks')} "
+        f"nav_labels={state.get('navLabels')} labyrinth_labels={state.get('labyrinthLabels')} "
+        f"dialogs={state.get('dialogs')} websocket={state.get('websocketState')}"
+    )
+
+async def accept_generic_confirmation_dialog(page: Page, timeout_ms: int = 1500) -> str:
+    dialogs = [
+        page.locator('[role="dialog"]').last,
+        page.locator("div.MuiDialog-root").last,
+        page.locator('div[class*="DialogModal_"]').last,
+    ]
+    dialog = await first_visible_locator(dialogs, timeout=timeout_ms / 1000)
+    if dialog is None:
+        return "no confirm dialog"
+
+    text = await locator_text(dialog, limit=1000)
+    yes_btn = await first_visible_enabled_locator(
+        [
+            *button_candidates(dialog, ["Yes", "OK", "Confirm", "Continue", "Close", "确定", "确认", "关闭"]),
+            dialog.locator("button.Button_success__6d6kU").last,
+        ],
+        timeout=1.2,
+    )
+    if yes_btn is None:
+        return f"confirm dialog visible but accept button not found: {text[:120]}"
+
+    await click_locator_hard(page, yes_btn, timeout_ms=2000)
+    await page.wait_for_timeout(300)
+    return "confirm dialog accepted"
+
+async def clear_visible_dialogs(page: Page, max_dialogs: int = 3) -> list[str]:
+    notes: list[str] = []
+    for idx in range(1, max_dialogs + 1):
+        dialog = await first_visible_locator(
+            [
+                page.locator('[role="dialog"]').last,
+                page.locator("div.MuiDialog-root").last,
+                page.locator('div[class*="DialogModal_"]').last,
+            ],
+            timeout=0.25,
+        )
+        if dialog is None:
+            break
+
+        text = await locator_text(dialog, limit=500)
+        note = await accept_generic_confirmation_dialog(page, timeout_ms=600)
+        if note == "no confirm dialog":
+            try:
+                await page.keyboard.press("Escape")
+                notes.append(f"dialog {idx}: pressed Escape ({text[:80]})")
+            except Exception as e:
+                notes.append(f"dialog {idx}: could not clear dialog ({e})")
+                break
+        else:
+            notes.append(f"dialog {idx}: {note} ({text[:80]})")
+        await page.wait_for_timeout(300)
+    return notes
+
+
 # ---------- Context / worker ----------
 
-async def new_context_for_account(browser: Browser, account: AccountConfig, settings: RunSettings) -> tuple[BrowserContext, Page]:
+async def new_context_for_account(
+    browser: Browser, account: AccountConfig, settings: RunSettings,
+    watcher: LabyrinthWebSocketWatcher | None = None,
+) -> tuple[BrowserContext, Page]:
     context = await browser.new_context(
         storage_state=account.state_file,
         service_workers="block",
         viewport={"width": 1280, "height": 900},
     )
-    if settings.block_assets:
-        await context.route("**/*", block_static_assets)
-    page = await context.new_page()
-    await goto_game_page(page, account.game_url, just_reloaded=True)
+    try:
+        if settings.block_assets:
+            await context.route("**/*", block_static_assets)
+        page = await context.new_page()
+        if watcher is not None:
+            watcher.install_page(page)
+        await goto_game_page(
+            page, account.game_url, just_reloaded=True,
+            shell_timeout_ms=settings.startup_timeout_ms,
+        )
+    except BaseException:
+        await safe_close_context(context, reason="initialization failed")
+        raise
     return context, page
 
 
@@ -952,10 +1273,11 @@ async def run_one_cycle(page: Page, settings: RunSettings) -> CycleResult:
         detail_parts.append(claim_detail)
         state_before = await detect_labyrinth_state(page)
         tickets_before = await read_ticket_count(page)
-        if claimed:
+        if not claimed or state_before.state == "finished":
             return CycleResult(
-                ok=True,
-                mode="claimed_result",
+                ok=False,
+                mode="claim_failed",
+                error="labyrinth result did not close after claiming",
                 detail="; ".join(detail_parts),
                 tickets_before=tickets_before.current,
                 tickets_after=tickets_before.current,
@@ -967,16 +1289,19 @@ async def run_one_cycle(page: Page, settings: RunSettings) -> CycleResult:
         escaped, escape_detail = await escape_labyrinth(page, timeout_ms=settings.navigation_timeout_ms)
         detail_parts.append(escape_detail)
         tickets_after = await read_ticket_count(page)
-        return CycleResult(
-            ok=escaped,
-            mode="escaped_finished_run" if escaped else "escape_failed",
-            error="" if escaped else escape_detail,
-            detail="; ".join(detail_parts),
-            tickets_before=tickets_before.current,
-            tickets_after=tickets_after.current,
-            tickets_max=tickets_after.max or tickets_before.max,
-            floor=None,
-        )
+        if not escaped:
+            return CycleResult(
+                ok=False,
+                mode="escape_failed",
+                error=escape_detail,
+                detail="; ".join(detail_parts),
+                tickets_before=tickets_before.current,
+                tickets_after=tickets_after.current,
+                tickets_max=tickets_after.max or tickets_before.max,
+                floor=None,
+            )
+        state_before = await detect_labyrinth_state(page)
+        tickets_before = tickets_after
 
     if state_before.state == "in_labyrinth":
         floor = await get_current_floor(page)
@@ -988,6 +1313,13 @@ async def run_one_cycle(page: Page, settings: RunSettings) -> CycleResult:
             tickets_after=tickets_before.current,
             tickets_max=tickets_before.max,
             floor=floor,
+        )
+
+    if state_before.state != "entry":
+        return CycleResult(
+            ok=False, mode="state_unavailable",
+            error=f"expected entry panel, got {state_before.state}",
+            detail="; ".join(detail_parts),
         )
 
     if tickets_before.current is not None and tickets_before.current <= settings.low_ticket_threshold:
@@ -1054,11 +1386,17 @@ async def account_worker(playwright: Playwright, account: AccountConfig, setting
     launch_kwargs: dict[str, Any] = {"headless": settings.headless}
     if settings.browser_channel:
         launch_kwargs["channel"] = settings.browser_channel
+    if settings.proxy_server:
+        launch_kwargs["proxy"] = {"server": settings.proxy_server}
     browser = await playwright.chromium.launch(**launch_kwargs)
 
     context: BrowserContext | None = None
     page: Page | None = None
     summary = WorkerSummary(account=account.name)
+    watcher = LabyrinthWebSocketWatcher() if settings.event_driven else None
+    if watcher is not None:
+        LOG.info("[%s] labyrinth websocket wakeups active; UI watchdog=%ss",
+                 account.name, settings.watchdog_sec)
 
     run_started_at: float | None = None
     run_started_by_script = False
@@ -1067,19 +1405,33 @@ async def account_worker(playwright: Playwright, account: AccountConfig, setting
     async def reset_context() -> None:
         nonlocal context, page
         await safe_close_context(context, reason="reset")
-        context, page = await new_context_for_account(browser, account, settings)
+        context, page = None, None
+        if watcher is not None:
+            watcher.reset_connection_state()
+        context, page = await new_context_for_account(browser, account, settings, watcher)
 
     try:
-        await reset_context()
         iteration = 1
 
         while settings.loops <= 0 or iteration <= settings.loops:
             t0 = time.perf_counter()
+            retry_soon = False
+            reason = ""
+            if watcher is not None:
+                reason = watcher.consume_reason()
+                watcher.maintenance_active = True
+                if reason:
+                    LOG.info("[%s] websocket signal: %s", account.name, reason)
             try:
+                if page is None or page.is_closed() or reason == "game websocket closed":
+                    await reset_context()
                 assert page is not None
 
                 if iteration > 1 and settings.refresh_every > 0 and iteration % settings.refresh_every == 0:
-                    await goto_game_page(page, account.game_url, just_reloaded=True)
+                    await goto_game_page(
+                        page, account.game_url, just_reloaded=True,
+                        shell_timeout_ms=settings.startup_timeout_ms,
+                    )
 
                 if iteration > 1 and settings.recycle_context_every > 0 and iteration % settings.recycle_context_every == 0:
                     await reset_context()
@@ -1116,6 +1468,9 @@ async def account_worker(playwright: Playwright, account: AccountConfig, setting
 
                 # Start timing only when the script itself started a run.
                 if result.ok and result.mode == "entered_labyrinth":
+                    if run_started_at is not None and run_started_by_script:
+                        LOG.info("[%s] previous labyrinth round finished in %s",
+                                 account.name, format_duration(time.time() - run_started_at))
                     run_started_at = time.time()
                     run_started_by_script = True
                     last_logged_floor = result.floor
@@ -1183,10 +1538,12 @@ async def account_worker(playwright: Playwright, account: AccountConfig, setting
                 await sink.write_row(row)
 
                 if not result.ok:
+                    retry_soon = True
                     LOG.warning("[%s] iteration %s failed: %s", account.name, iteration, result.error)
                     if settings.save_failure_screenshots:
                         await take_failure_screenshot(page, debug_dir / f"{account.name}_fail_{iteration}.png")
-                    await reset_context()
+                    await safe_close_context(context, reason="cycle failed")
+                    context, page = None, None
                     run_started_at = None
                     run_started_by_script = False
                     last_logged_floor = None
@@ -1202,6 +1559,7 @@ async def account_worker(playwright: Playwright, account: AccountConfig, setting
                     )
 
             except Exception as e:
+                retry_soon = True
                 summary.total += 1
                 summary.failed += 1
                 err = str(e)
@@ -1224,13 +1582,26 @@ async def account_worker(playwright: Playwright, account: AccountConfig, setting
                         "detail": "",
                     }
                 )
-                await reset_context()
+                await safe_close_context(context, reason="cycle exception")
+                context, page = None, None
                 run_started_at = None
                 run_started_by_script = False
                 last_logged_floor = None
+            finally:
+                if watcher is not None:
+                    watcher.maintenance_active = False
 
             iteration += 1
-            await asyncio.sleep(settings.delay_sec)
+            if settings.loops > 0 and iteration > settings.loops:
+                break
+            wait_sec = settings.watchdog_sec if watcher is not None else settings.delay_sec
+            if retry_soon:
+                wait_sec = min(60.0, max(5.0, settings.delay_sec))
+                await asyncio.sleep(wait_sec)
+            elif watcher is not None:
+                await watcher.wait(wait_sec)
+            else:
+                await asyncio.sleep(wait_sec)
 
         return summary
 
@@ -1308,6 +1679,8 @@ async def probe_account(playwright: Playwright, account: AccountConfig, settings
     launch_kwargs: dict[str, Any] = {"headless": settings.headless}
     if settings.browser_channel:
         launch_kwargs["channel"] = settings.browser_channel
+    if settings.proxy_server:
+        launch_kwargs["proxy"] = {"server": settings.proxy_server}
     browser = await playwright.chromium.launch(**launch_kwargs)
 
     context: BrowserContext | None = None
@@ -1427,8 +1800,14 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--account", default=None)
     run_p.add_argument("--loops", type=int, default=0, help="0 means run forever")
     run_p.add_argument("--delay-sec", type=float, default=20.0)
-    run_p.add_argument("--refresh-every", type=int, default=40)
-    run_p.add_argument("--recycle-context-every", type=int, default=200)
+    run_p.add_argument("--event-driven", action=argparse.BooleanOptionalAction, default=True)
+    run_p.add_argument("--watchdog-sec", type=float, default=600.0,
+                       help="fallback UI check interval in event mode")
+    run_p.add_argument("--startup-timeout-ms", type=int, default=60000)
+    run_p.add_argument("--proxy-server", default=None,
+                       help="optional process-only proxy; default is direct")
+    run_p.add_argument("--refresh-every", type=int, default=0)
+    run_p.add_argument("--recycle-context-every", type=int, default=0)
     run_p.add_argument("--low-ticket-threshold", type=int, default=0)
     run_p.add_argument("--results-csv", default="auto_labyrinth_results.csv")
     run_p.add_argument("--debug-dir", default="autolabyrinth_debug")
@@ -1444,6 +1823,8 @@ def build_parser() -> argparse.ArgumentParser:
     probe_p.add_argument("--account", default=None)
     probe_p.add_argument("--debug-dir", default="autolabyrinth_debug")
     probe_p.add_argument("--browser-channel", default=None)
+    probe_p.add_argument("--proxy-server", default=None)
+    probe_p.add_argument("--startup-timeout-ms", type=int, default=60000)
     probe_p.add_argument("--headless", action=argparse.BooleanOptionalAction, default=False)
     probe_p.add_argument("--block-assets", action=argparse.BooleanOptionalAction, default=True)
     probe_p.add_argument("--verbose", action="store_true")
@@ -1460,8 +1841,12 @@ async def async_main(args: argparse.Namespace) -> int:
     settings = RunSettings(
         loops=getattr(args, "loops", 0),
         delay_sec=getattr(args, "delay_sec", 20.0),
-        refresh_every=getattr(args, "refresh_every", 40),
-        recycle_context_every=getattr(args, "recycle_context_every", 200),
+        event_driven=getattr(args, "event_driven", True),
+        watchdog_sec=getattr(args, "watchdog_sec", 600.0),
+        startup_timeout_ms=getattr(args, "startup_timeout_ms", 60000),
+        proxy_server=getattr(args, "proxy_server", None),
+        refresh_every=getattr(args, "refresh_every", 0),
+        recycle_context_every=getattr(args, "recycle_context_every", 0),
         low_ticket_threshold=getattr(args, "low_ticket_threshold", 0),
         results_csv=getattr(args, "results_csv", "auto_labyrinth_results.csv"),
         debug_dir=getattr(args, "debug_dir", "autolabyrinth_debug"),
@@ -1471,6 +1856,8 @@ async def async_main(args: argparse.Namespace) -> int:
         save_failure_screenshots=getattr(args, "save_failure_screenshots", False),
         block_assets=getattr(args, "block_assets", True),
     )
+    if settings.watchdog_sec <= 0 or settings.delay_sec <= 0 or settings.startup_timeout_ms <= 0:
+        raise ValueError("watchdog, polling interval, and startup timeout must be positive")
 
     if args.command == "probe":
         outputs = await run_probe(accounts, settings)
